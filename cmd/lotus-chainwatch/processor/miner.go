@@ -34,25 +34,6 @@ func (p *Processor) setupMiners() error {
 	}
 
 	if _, err := tx.Exec(`
-create table if not exists miner_sectors
-(
-	miner_id text not null,
-	sector_id bigint not null,
-	
-	activation_epoch bigint not null,
-	expiration_epoch bigint not null,
-	termination_epoch bigint,
-	
-	deal_weight text not null,
-	verified_deal_weight text not null,
-	seal_cid text not null,
-	seal_rand_epoch bigint not null,
-	constraint miner_sectors_pk
-		primary key (miner_id, sector_id)
-);
-
-create index if not exists miner_sectors_miner_sectorid_index
-	on miner_sectors (miner_id, sector_id);
 
 create table if not exists miner_info
 (
@@ -82,6 +63,41 @@ create table if not exists miner_power
 		primary key (miner_id, state_root)
 );
 
+create table if not exists miner_precommits
+(
+	miner_id text not null,
+	sector_id bigint not null,
+	
+	precommit_deposit text not null,
+	precommit_epoch text not null,
+	constraint miner_precommits_pk
+		primary key (miner_id, sector_id)
+    
+);
+
+create index if not exists miner_precommit_miner_sectorid_index
+	on miner_precommits (miner_id, sector_id);
+
+create table if not exists miner_sectors
+(
+	miner_id text not null,
+	sector_id bigint not null,
+	
+	activation_epoch bigint not null,
+	expiration_epoch bigint not null,
+	termination_epoch bigint,
+	
+	deal_weight text not null,
+	verified_deal_weight text not null,
+	seal_cid text not null,
+	seal_rand_epoch bigint not null,
+	constraint miner_sectors_pk
+		primary key (miner_id, sector_id)
+);
+
+create index if not exists miner_sectors_miner_sectorid_index
+	on miner_sectors (miner_id, sector_id);
+
 /* used to tell when a miners sectors (proven-not-yet-expired) changed if the miner_sectors_cid's are different a new sector was added or removed (terminated/expired) */
 create table if not exists miner_sectors_heads
 (
@@ -95,12 +111,13 @@ create table if not exists miner_sectors_heads
     
 );
 
+
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'miner_sector_event_type') THEN
         CREATE TYPE miner_sector_event_type AS ENUM
         (
-			'ADDED','EXTENDED', 'EXPIRED', 'TERMINATED'
+			'PRECOMMIT', 'COMMIT', 'EXTENDED', 'EXPIRED', 'TERMINATED'
         );
     END IF;
 END$$;
@@ -113,8 +130,14 @@ create table if not exists miner_sector_events
     event miner_sector_event_type not null,
     
 	constraint miner_sector_events_pk
-		primary key (sector_id, event, miner_id, state_root)
-)
+		primary key (sector_id, event, miner_id)
+);
+
+create materialized view if not exists miner_sectors_view as
+select ms.miner_id, ms.sector_id, mp.precommit_epoch, ms.activation_epoch, ms.expiration_epoch, ms.termination_epoch, ms.deal_weight, ms.verified_deal_weight
+from miner_sectors ms
+left join miner_precommits mp on ms.sector_id = mp.sector_id and ms.miner_id = mp.miner_id
+
 `); err != nil {
 		return err
 	}
@@ -228,7 +251,7 @@ func (p *Processor) persistMiners(ctx context.Context, miners []minerActorInfo) 
 	})
 
 	grp.Go(func() error {
-		if err := p.storeMinersSectorState(miners); err != nil {
+		if err := p.storeMinersSectorState(ctx, miners); err != nil {
 			return err
 		}
 		return nil
@@ -236,6 +259,13 @@ func (p *Processor) persistMiners(ctx context.Context, miners []minerActorInfo) 
 
 	grp.Go(func() error {
 		if err := p.storeMinersSectorHeads(miners); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	grp.Go(func() error {
+		if err := p.storeMinersPreCommitState(ctx, miners); err != nil {
 			return err
 		}
 		return nil
@@ -347,7 +377,7 @@ func (p *Processor) storeMinersPower(miners []minerActorInfo) error {
 
 }
 
-func (p *Processor) storeMinersSectorState(miners []minerActorInfo) error {
+func (p *Processor) storeMinersSectorState(ctx context.Context, miners []minerActorInfo) error {
 	start := time.Now()
 	defer func() {
 		log.Infow("Stored Miners Sector State", "duration", time.Since(start).String())
@@ -367,7 +397,7 @@ func (p *Processor) storeMinersSectorState(miners []minerActorInfo) error {
 		return err
 	}
 
-	grp, ctx := errgroup.WithContext(context.TODO())
+	grp, ctx := errgroup.WithContext(ctx)
 	for _, m := range miners {
 		m := m
 		grp.Go(func() error {
@@ -451,6 +481,87 @@ func (p *Processor) storeMinersSectorHeads(miners []minerActorInfo) error {
 	return tx.Commit()
 }
 
+func (p *Processor) storeMinersPreCommitState(ctx context.Context, miners []minerActorInfo) error {
+	start := time.Now()
+	defer func() {
+		log.Infow("Stored Miners Precommit State", "duration", time.Since(start).String())
+	}()
+
+	precommitTx, err := p.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	eventTx, err := p.db.Begin()
+	if err != nil {
+		return err
+	}
+
+	if _, err := eventTx.Exec(`create temp table mse (like miner_sector_events excluding constraints) on commit drop;`); err != nil {
+		return xerrors.Errorf("prep temp: %w", err)
+	}
+
+	eventStmt, err := eventTx.Prepare(`copy mse (sector_id, event, miner_id, state_root) from STDIN `)
+	if err != nil {
+		return err
+	}
+
+	if _, err := precommitTx.Exec(`create temp table mp (like miner_precommits excluding constraints) on commit drop;`); err != nil {
+		return xerrors.Errorf("prep temp: %w", err)
+	}
+
+	precommitStmt, err := precommitTx.Prepare(`copy mp (miner_id, sector_id, precommit_deposit, precommit_epoch) from STDIN`)
+	if err != nil {
+		return err
+	}
+
+	for _, m := range miners {
+		pcMap, err := adt.AsMap(cw_util.NewAPIIpldStore(ctx, p.node), m.state.PreCommittedSectors)
+		if err != nil {
+			return err
+		}
+		precommit := new(miner.SectorPreCommitOnChainInfo)
+		if err := pcMap.ForEach(precommit, func(key string) error {
+			if _, err := precommitStmt.Exec(
+				m.common.addr.String(),
+				precommit.Info.SectorNumber,
+				precommit.PreCommitDeposit.String(),
+				precommit.PreCommitEpoch,
+			); err != nil {
+				return err
+			}
+
+			if _, err := eventStmt.Exec(precommit.Info.SectorNumber, "PRECOMMIT", m.common.addr.String(), m.common.stateroot.String()); err != nil {
+				return err
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	if err := precommitStmt.Close(); err != nil {
+		return err
+	}
+	if err := eventStmt.Close(); err != nil {
+		return err
+	}
+
+	if _, err := precommitTx.Exec(`insert into miner_precommits select * from mp on conflict do nothing`); err != nil {
+		return err
+	}
+
+	if _, err := eventTx.Exec(`insert into miner_sector_events select * from mse on conflict do nothing `); err != nil {
+		return xerrors.Errorf("actor put: %w", err)
+	}
+
+	if err := eventTx.Commit(); err != nil {
+		return err
+	}
+
+	return precommitTx.Commit()
+}
+
 func (p *Processor) updateMiners(ctx context.Context, miners []minerActorInfo) error {
 	// TODO when/if there is more than one update operation here use an errgroup as is done in persistMiners
 	if err := p.updateMinersSectors(ctx, miners); err != nil {
@@ -497,6 +608,19 @@ func (p *Processor) updateMinersSectors(ctx context.Context, miners []minerActor
 	complete := 0
 	for _, m := range miners {
 		m := m
+		if m.common.tsKey == p.genesisTs.Key() {
+			genSectors, err := p.node.StateMinerSectors(ctx, m.common.addr, nil, true, p.genesisTs.Key())
+			if err != nil {
+				return err
+			}
+			for _, sector := range genSectors {
+				if _, err := eventStmt.Exec(sector.ID, "COMMIT", m.common.addr.String(), m.common.stateroot.String()); err != nil {
+					return err
+				}
+			}
+			complete++
+			continue
+		}
 		minerGrp.Go(func() error {
 			// special case genesis miners
 			sectorDiffFn := pred.OnMinerActorChange(m.common.addr, pred.OnMinerSectorChange())
@@ -561,7 +685,7 @@ func (p *Processor) updateMinersSectors(ctx context.Context, miners []minerActor
 			}
 
 			for _, added := range changes.Added {
-				if _, err := eventStmt.Exec(added.Info.SectorNumber, "ADDED", m.common.addr.String(), m.common.stateroot.String()); err != nil {
+				if _, err := eventStmt.Exec(added.Info.SectorNumber, "COMMIT", m.common.addr.String(), m.common.stateroot.String()); err != nil {
 					return err
 				}
 			}
